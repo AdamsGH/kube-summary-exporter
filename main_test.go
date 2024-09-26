@@ -81,7 +81,14 @@ kube_summary_pod_ephemeral_storage_used_bytes{namespace="mon",pod="dev-server-0"
 		t.Fatal(err)
 	}
 
-	collectSummaryMetrics(&summary, registry)
+	results := []PerNodeResult{
+		{
+			NodeName: "dev-server-node",
+			Summary:  &summary,
+		},
+	}
+
+	collectSummaryMetrics(results, registry)
 
 	tmpfile, err := os.CreateTemp("", "test-summary.prom")
 	if err != nil {
