@@ -5,8 +5,6 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"html"
-	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"net/http"
 	"os"
 	"strconv"
@@ -15,6 +13,8 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	corev1 "k8s.io/api/core/v1"
+	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 	stats "k8s.io/kubelet/pkg/apis/stats/v1alpha1"
@@ -418,50 +418,89 @@ func collectSummaryMetrics(results []PerNodeResult, registry *prometheus.Registr
 	}
 }
 
-func allNodesHandler(w http.ResponseWriter, r *http.Request, kubeClient *kubernetes.Clientset) {
-	// If a timeout is configured via the Prometheus header, add it to the request.
-	if v := r.Header.Get("X-Prometheus-Scrape-Timeout-Seconds"); v != "" {
-		var err error
-		timeoutSeconds, err := strconv.ParseFloat(v, 64)
-		if err != nil {
-			http.Error(w, fmt.Sprintf("Error parsing timeout from X-Prometheus-Scrape-Timeout-Seconds=%s: %v", html.EscapeString(v), err), http.StatusInternalServerError)
-			return
-		}
-		ctx, cancel := context.WithTimeout(r.Context(), time.Duration(timeoutSeconds*float64(time.Second)))
-		defer cancel()
-		r = r.WithContext(ctx)
-	}
+// handleMetricsCollection is a generic handler for collecting metrics
+func handleMetricsCollection(w http.ResponseWriter, r *http.Request, kubeClient *kubernetes.Clientset, nodeSelector func(context.Context, *kubernetes.Clientset) ([]PerNodeResult, error)) {
+	ctx, cancel := getTimeoutContext(r)
+	defer cancel()
 
-	nodes, err := kubeClient.CoreV1().Nodes().List(r.Context(), v1.ListOptions{})
+	results, err := nodeSelector(ctx, kubeClient)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("Error enumerating nodes: %v", err), http.StatusInternalServerError)
+		http.Error(w, fmt.Sprintf("Error collecting node stats: %v", err), http.StatusInternalServerError)
+		return
 	}
 
-	var statsCollection []PerNodeResult
-	for _, node := range nodes.Items {
-		req := kubeClient.CoreV1().RESTClient().Get().Resource("nodes").Name(node.Name).SubResource("proxy").Suffix("stats/summary")
-		resp, err := req.DoRaw(r.Context())
+	registry := prometheus.NewRegistry()
+	collectSummaryMetrics(results, registry)
+	h := promhttp.HandlerFor(registry, promhttp.HandlerOpts{})
+	h.ServeHTTP(w, r)
+}
+
+// allNodesSelector selects all nodes in the cluster
+func allNodesSelector(ctx context.Context, kubeClient *kubernetes.Clientset) ([]PerNodeResult, error) {
+	nodes, err := kubeClient.CoreV1().Nodes().List(ctx, meta_v1.ListOptions{}) // Использование meta_v1.ListOptions
+	if err != nil {
+		return nil, fmt.Errorf("error enumerating nodes: %v", err)
+	}
+
+	return collectNodeStats(ctx, kubeClient, nodes.Items)
+}
+
+// singleNodeSelector selects a single node by name
+func singleNodeSelector(nodeName string) func(context.Context, *kubernetes.Clientset) ([]PerNodeResult, error) {
+	return func(ctx context.Context, kubeClient *kubernetes.Clientset) ([]PerNodeResult, error) {
+		node, err := kubeClient.CoreV1().Nodes().Get(ctx, nodeName, meta_v1.GetOptions{}) // Использование meta_v1.GetOptions
 		if err != nil {
-			http.Error(w, fmt.Sprintf("Error querying /stats/summary for %s: %v", html.EscapeString(node.Name), err), http.StatusInternalServerError)
-			return
+			return nil, fmt.Errorf("error getting node %s: %v", nodeName, err)
 		}
 
-		summary := &stats.Summary{}
-		if err := json.Unmarshal(resp, summary); err != nil {
-			http.Error(w, fmt.Sprintf("Error unmarshaling /stats/summary response for %s: %v", html.EscapeString(node.Name), err), http.StatusInternalServerError)
-			return
+		return collectNodeStats(ctx, kubeClient, []corev1.Node{*node}) // Использование corev1.Node
+	}
+}
+
+// collectNodeStats collects stats for the given nodes
+func collectNodeStats(ctx context.Context, kubeClient *kubernetes.Clientset, nodes []corev1.Node) ([]PerNodeResult, error) {
+	var results []PerNodeResult
+
+	for _, node := range nodes {
+		summary, err := getNodeSummary(ctx, kubeClient, node.Name)
+		if err != nil {
+			return nil, err
 		}
 
-		statsCollection = append(statsCollection, PerNodeResult{
-			NodeName: summary.Node.NodeName,
+		results = append(results, PerNodeResult{
+			NodeName: node.Name,
 			Summary:  summary,
 		})
 	}
 
-	registry := prometheus.NewRegistry()
-	collectSummaryMetrics(statsCollection, registry)
-	h := promhttp.HandlerFor(registry, promhttp.HandlerOpts{})
-	h.ServeHTTP(w, r)
+	return results, nil
+}
+
+// getNodeSummary retrieves the summary for a single node
+func getNodeSummary(ctx context.Context, kubeClient *kubernetes.Clientset, nodeName string) (*stats.Summary, error) {
+	req := kubeClient.CoreV1().RESTClient().Get().Resource("nodes").Name(nodeName).SubResource("proxy").Suffix("stats/summary")
+	resp, err := req.DoRaw(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("error querying /stats/summary for %s: %v", nodeName, err)
+	}
+
+	summary := &stats.Summary{}
+	if err := json.Unmarshal(resp, summary); err != nil {
+		return nil, fmt.Errorf("error unmarshaling /stats/summary response for %s: %v", nodeName, err)
+	}
+
+	return summary, nil
+}
+
+// getTimeoutContext returns a context with timeout based on the X-Prometheus-Scrape-Timeout-Seconds header
+func getTimeoutContext(r *http.Request) (context.Context, context.CancelFunc) {
+	if v := r.Header.Get("X-Prometheus-Scrape-Timeout-Seconds"); v != "" {
+		timeoutSeconds, err := strconv.ParseFloat(v, 64)
+		if err == nil {
+			return context.WithTimeout(r.Context(), time.Duration(timeoutSeconds*float64(time.Second)))
+		}
+	}
+	return context.WithCancel(r.Context())
 }
 
 // newKubeClient returns a Kubernetes client (clientset) from the supplied
@@ -502,7 +541,11 @@ func main() {
 
 	r := mux.NewRouter()
 	r.HandleFunc("/nodes", func(w http.ResponseWriter, r *http.Request) {
-		allNodesHandler(w, r, kubeClient)
+		handleMetricsCollection(w, r, kubeClient, allNodesSelector)
+	})
+	r.HandleFunc("/node/{node}", func(w http.ResponseWriter, r *http.Request) {
+		nodeName := mux.Vars(r)["node"]
+		handleMetricsCollection(w, r, kubeClient, singleNodeSelector(nodeName))
 	})
 	r.Handle("/metrics", promhttp.Handler())
 	r.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -510,8 +553,9 @@ func main() {
     <head><title>Kube Summary Exporter</title></head>
     <body>
         <h1>Kube Summary Exporter</h1>
-        <p><a href="node/example-node">Retrieve metrics for 'example-node'</a></p>
-        <p><a href="metrics">Metrics</a></p>
+        <p><a href="/nodes">Retrieve metrics for all nodes</a></p>
+        <p><a href="/node/example-node">Retrieve metrics for 'example-node'</a></p>
+        <p><a href="/metrics">Metrics</a></p>
     </body>
 </html>`))
 	})
